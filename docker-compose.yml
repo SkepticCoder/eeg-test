@@ -1,0 +1,189 @@
+version: '3.7'
+
+x-flink-common:
+  &flink-common
+  image: flink:${FLINK_VERSION:-1.13-scala_2.12-java11}
+  networks:
+    - eeg-assesment
+  environment:
+    - |
+      FLINK_PROPERTIES=
+      jobmanager.rpc.address: jobmanager
+
+      taskmanager.numberOfTaskSlots: 2
+      parallelism.default: 2
+  volumes:
+    - ./flink:/opt/flink/usrlib
+    - flink_data:/opt/flink
+
+services:
+  portainer:
+    image: portainer/portainer:${PORTAINER_VERSION:-latest}
+    container_name: portainer
+    command: -H unix:///var/run/docker.sock
+    restart: always
+    networks:
+      - eeg-assesment
+    ports:
+      - 7000:9000
+      - 8000:8000
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - portainer_data:/data
+
+  zookeeper:
+    image: confluentinc/cp-zookeeper:${CONFLUENT_VERSION:-6.2.0}
+    networks:
+      - eeg-assesment
+    restart: unless-stopped
+    container_name: zookeeper
+    ports:
+      - "2181:2181"
+      - "9991:9991"
+    environment:
+      ZOOKEEPER_TICK_TIME: 2000
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_SYNC_LIMIT: 2
+      ZOOKEEPER_SERVER_ID: 1
+      KAFKA_JMX_PORT: 9991
+      KAFKA_JMX_container_name: 127.0.0.1
+    volumes:
+      - zookeeper_data:/data
+      - zookeeper_log:/dagalog
+
+  kafka:
+    image: confluentinc/cp-kafka:${CONFLUENT_VERSION:-6.2.0}
+    container_name: kafka
+    networks:
+      - eeg-assesment
+    ports:
+      - "9092:9092"
+      - "9995:9991"
+    environment:
+      KAFKA_ADVERTISED_LISTENERS: LISTENER_DOCKER_INTERNAL://kafka:19092,LISTENER_DOCKER_EXTERNAL://${DOCKER_HOST_IP:-127.0.0.1}:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: LISTENER_DOCKER_INTERNAL:PLAINTEXT,LISTENER_DOCKER_EXTERNAL:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: LISTENER_DOCKER_INTERNAL
+      KAFKA_ZOOKEEPER_CONNECT: "zookeeper:2181"
+      KAFKA_NUM_PARTITIONS: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_NUM_PARTITIONS: 3
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_BROKER_ID: 1
+      KAFKA_LOG4J_LOGGERS: "kafka.controller=INFO,kafka.producer.async.DefaultEventHandler=INFO,state.change.logger=INFO"
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_SCHEMA_REGISTRY_URL: "kafka-schema-registry:8081"
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_DELETE_TOPIC_ENABLE: "true"
+      KAFKA_JMX_PORT: 9991
+      KAFKA_JMX_container_name: 127.0.0.1
+    volumes:
+       - kafka_data:/var/lib/kafka/data
+    depends_on:
+      - zookeeper
+
+
+  # FLINK
+  jobmanager:
+    <<: *flink-common
+    ports:
+      - "8070:8081"
+    command: jobmanager
+  #    command: standalone-job --job-classname com.job.ClassName [--job-id <job id>] [--fromSavepoint /path/to/savepoint [--allowNonRestoredState]] [job arguments]
+
+
+  taskmanager:
+    <<: *flink-common
+    depends_on:
+      - jobmanager
+    command: taskmanager
+    scale: 1
+    networks:
+      - eeg-assesment
+
+
+  kafka-schema-registry:
+    image: confluentinc/cp-schema-registry:${CONFLUENT_VERSION:-6.2.0}
+    container_name: kafka-schema-registry
+    networks:
+      - eeg-assesment
+    ports:
+      - "18081:8081"
+    environment:
+      SCHEMA_REGISTRY_KAFKASTORE_BOOTSTRAP_SERVERS: PLAINTEXT://kafka:19092
+      SCHEMA_REGISTRY_HOST_NAME: kafka-schema-registry
+      SCHEMA_REGISTRY_LISTENERS: http://0.0.0.0:8081
+    depends_on:
+      - zookeeper
+      - kafka
+
+  kafka-rest-proxy:
+    image: confluentinc/cp-kafka-rest:${CONFLUENT_VERSION:-6.2.0}
+    container_name: kafka-rest-proxy
+    networks:
+      - eeg-assesment
+    ports:
+      - "18082:8082"
+    environment:
+      KAFKA_REST_LISTENERS: http://0.0.0.0:8082/
+      KAFKA_REST_SCHEMA_REGISTRY_URL: http://kafka-schema-registry:8081/
+      KAFKA_REST_HOST_NAME: kafka-rest-proxy
+      KAFKA_REST_BOOTSTRAP_SERVERS: PLAINTEXT://kafka:19092
+    depends_on:
+      - kafka
+      - kafka-schema-registry
+
+   # FOR MONITORING and UI
+  ksqldb-server:
+    image: confluentinc/ksqldb-server:${CONFLUENT_KSQLDB_VERSION:-latest}
+    container_name: ksqldb-server
+    networks:
+      - eeg-assesment
+    ports:
+      - "8088:8088"
+    environment:
+      KSQL_BOOTSTRAP_SERVERS: PLAINTEXT://kafka:19092
+      KSQL_LISTENERS: http://0.0.0.0:8088/
+      KSQL_KSQL_SERVICE_ID: ksqldb-server_
+      KSQL_KSQL_SCHEMA_REGISTRY_URL: http://kafka-schema-registry:8081
+      KSQL_KSQL_CONNECT_URL: http://kafka-connect:8083
+      KSQL_KSQL_INTERNAL_TOPIC_REPLICAS: 1
+      KSQL_KSQL_SINK_REPLICAS: 1
+      KSQL_KSQL_STREAMS_REPLICATION_FACTOR: 1
+    depends_on:
+      - kafka
+      - kafka-schema-registry
+
+  kafka-ui:
+    image: provectuslabs/kafka-ui:${KAFKA_UI_VERSION:-latest}
+    container_name: kafka-ui
+    networks:
+      - eeg-assesment
+    ports:
+      - "18080:8080"
+    restart: always
+    environment:
+      - KAFKA_CLUSTERS_0_NAME=local
+      - KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS=kafka:19092
+      - KAFKA_CLUSTERS_0_ZOOKEEPER=zookeeper:2181
+      - KAFKA_CLUSTERS_0_KSQLDBSERVER=ksqldb-server:8088
+      - KAFKA_CLUSTERS_0_SCHEMAREGISTRY=kafka-schema-registry:8081
+      - KAFKA_CLUSTERS_0_JMXPORT=9991
+      - LOGGING_LEVEL_COM_PROVECTUS=info
+    depends_on:
+      - kafka-schema-registry
+      - ksqldb-server
+
+
+networks:
+  eeg-assesment:
+    name: eeg-assesment
+    ipam:
+      config:
+        - subnet: ${NETWORK:-172.16.59.0/24}
+
+volumes:
+  portainer_data:
+  kafka_data:
+  zookeeper_data:
+  zookeeper_log:
+  flink_data:
